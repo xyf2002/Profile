@@ -43,37 +43,35 @@ def extract_metrics(csv_path):
         if len(df) == 0:
             return None
         
-        # SM Utilization
-        if 'sm__cycles_active.avg' in df.columns and 'sm__cycles_elapsed.avg.per_second' in df.columns:
-            active_cycles = pd.to_numeric(df['sm__cycles_active.avg'].iloc[0], errors='coerce')
-            elapsed_cycles = pd.to_numeric(df['sm__cycles_elapsed.avg.per_second'].iloc[0], errors='coerce')
-            if not pd.isna(active_cycles) and not pd.isna(elapsed_cycles) and elapsed_cycles > 0:
-                sm_percent = (active_cycles / elapsed_cycles) * 100
-                metrics['Avg SMs busy (%)'] = round(min(sm_percent, 100), 1)
-        
-        # Compute Throughput
-        if 'sm__inst_executed.avg.pct_of_peak_sustained_elapsed' in df.columns:
-            val = pd.to_numeric(df['sm__inst_executed.avg.pct_of_peak_sustained_elapsed'].iloc[0], 
+        # SM Utilization - percentage of time SMs are actively issuing instructions
+        # This metric directly measures SM busy time as a percentage
+        if 'sm__issue_active.avg.pct_of_peak_sustained_elapsed' in df.columns:
+            val = pd.to_numeric(df['sm__issue_active.avg.pct_of_peak_sustained_elapsed'].iloc[0], 
                               errors='coerce')
             if not pd.isna(val):
-                metrics['Compute Throughput(%)'] = round(float(val), 1)
+                val_float = min(float(val), 100)
+                metrics['Avg SMs busy (%)'] = round(val_float, 1)
         
-        # Memory Bandwidth - DRAM bytes read/write
-        if 'dram__bytes_read.sum.pct_of_peak_sustained_elapsed' in df.columns:
-            val_read = pd.to_numeric(df['dram__bytes_read.sum.pct_of_peak_sustained_elapsed'].iloc[0], 
-                                    errors='coerce')
-            if 'dram__bytes_write.sum.pct_of_peak_sustained_elapsed' in df.columns:
-                val_write = pd.to_numeric(df['dram__bytes_write.sum.pct_of_peak_sustained_elapsed'].iloc[0], 
-                                        errors='coerce')
-                if not pd.isna(val_read) and not pd.isna(val_write):
-                    total_dram = (float(val_read) + float(val_write)) / 2
-                    metrics['Memory Bandwidth(%)'] = round(min(total_dram, 100), 1)
-        
-        # Memory Capacity - L2 cache hit rate
-        if 'lts__t_sector_hit_rate.pct' in df.columns:
-            val = pd.to_numeric(df['lts__t_sector_hit_rate.pct'].iloc[0], errors='coerce')
+        # Compute Throughput - SM throughput percentage (Nsight Compute official metric)
+        if 'sm__throughput.avg.pct_of_peak_sustained_elapsed' in df.columns:
+            val = pd.to_numeric(df['sm__throughput.avg.pct_of_peak_sustained_elapsed'].iloc[0], 
+                              errors='coerce')
             if not pd.isna(val):
-                metrics['Memory Capacity(%)'] = round(float(val), 1)
+                val_float = min(float(val), 100)
+                metrics['Compute Throughput(%)'] = round(val_float, 1)
+        
+        # Memory Bandwidth - GPU compute memory throughput utilization
+        # This measures the actual memory traffic including all cache levels
+        # (More comprehensive than just DRAM bytes)
+        if 'gpu__compute_memory_throughput.avg.pct_of_peak_sustained_elapsed' in df.columns:
+            val = pd.to_numeric(df['gpu__compute_memory_throughput.avg.pct_of_peak_sustained_elapsed'].iloc[0], 
+                              errors='coerce')
+            if not pd.isna(val):
+                val_float = min(float(val), 100)
+                if val_float < 0.1 and val_float > 0:
+                    metrics['Memory Bandwidth(%)'] = round(val_float, 2)
+                else:
+                    metrics['Memory Bandwidth(%)'] = round(val_float, 1)
         
         return metrics if metrics else None
         
@@ -147,7 +145,7 @@ def create_summary_table(results):
     # Select columns in desired order
     columns = ['Model', 'N', 'K', 'M', 'Workload', 'Batch size', 
                'Avg SMs busy (%)', 'Compute Throughput(%)', 
-               'Memory Bandwidth(%)', 'Memory Capacity(%)']
+               'Memory Bandwidth(%)']
     
     # Only include columns that exist
     columns = [col for col in columns if col in df.columns]
@@ -181,10 +179,9 @@ def save_outputs(df, output_csv):
             f.write("| " + " | ".join(str(v) for v in row.values) + " |\n")
         f.write("\n## Legend\n\n")
         f.write("- **N, K, M**: GEMM matrix dimensions (A: N×K, B: K×M, C: N×M)\n")
-        f.write("- **Avg SMs busy (%)**: Streaming Multiprocessor utilization\n")
-        f.write("- **Compute Throughput(%)**: GPU compute instruction throughput\n")
-        f.write("- **Memory Bandwidth(%)**: DRAM memory bandwidth utilization\n")
-        f.write("- **Memory Capacity(%)**: L2 cache hit rate\n")
+        f.write("- **Avg SMs busy (%)**: Streaming Multiprocessor utilization (% of time SMs are issuing instructions)\n")
+        f.write("- **Compute Throughput(%)**: SM throughput utilization (Nsight Compute: sm_throughput)\n")
+        f.write("- **Memory Bandwidth(%)**: GPU compute memory throughput utilization (Nsight Compute: gpu_compute_memory_throughput)\n")
     
     print(f"✓ Markdown saved to: {md_path}")
     
