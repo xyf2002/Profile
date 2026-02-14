@@ -57,11 +57,13 @@ while IFS=',' read -r n k m rest; do
         continue
     fi
     
-    # Step 1: Run Nsys profiling
+    # Step 1: Run Nsys profiling with detailed GPU metrics
     echo "  → Running Nsys profiling..."
     nsys profile \
+        -w true \
+        -t cuda,cudnn,cublas \
         -o "$nsys_report" \
-        --gpu-metrics-devices 0 \
+        -f true \
         python3 profile_gemm_nsys.py --n "$n" --k "$k" --m "$m" --iter 10 > /dev/null 2>&1
     
     if [ -f "${nsys_report}.nsys-rep" ]; then
@@ -70,13 +72,13 @@ while IFS=',' read -r n k m rest; do
         # Step 2: Convert to CSV using nsys stats
         echo "  → Converting to CSV..."
         if nsys stats "${nsys_report}.nsys-rep" \
-            --report cuda_gpu_kern_sum \
+            --report cuda_gpu_trace \
             --format csv \
             -o "${nsys_report}_stats" 2>/dev/null; then
             
-            # Rename CSV file to remove _stats_cuda_gpu_kern_sum suffix
-            if [ -f "${nsys_report}_stats_cuda_gpu_kern_sum.csv" ]; then
-                mv "${nsys_report}_stats_cuda_gpu_kern_sum.csv" "${nsys_report}.csv"
+            # Rename CSV file to remove _stats_cuda_gpu_trace suffix
+            if [ -f "${nsys_report}_stats_cuda_gpu_trace.csv" ]; then
+                mv "${nsys_report}_stats_cuda_gpu_trace.csv" "${nsys_report}.csv"
                 echo "    ✓ CSV file created"
                 success=$((success + 1))
                 
