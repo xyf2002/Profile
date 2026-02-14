@@ -1,13 +1,15 @@
 #!/usr/bin/env python3
 """
-Process all NVIDIA NCU profiling CSV files from profiled_data directory
+Process all NVIDIA NCU and NSys profiling CSV files from profiled_data and profiled_data_nsys directories
 and generate a comprehensive performance benchmark table.
 
 This script:
-1. Scans profiled_data directory for all CSV files
-2. Extracts metrics from each file
-3. Generates a formatted table matching the benchmark format
-4. Outputs CSV and Markdown formats
+1. Scans profiled_data directory for NCU CSV files
+2. Scans profiled_data_nsys directory for NSys CSV files
+3. Extracts Avg SMs busy (%) from NSys data
+4. Extracts other metrics from NCU data
+5. Generates a formatted table matching the benchmark format
+6. Outputs CSV and Markdown formats
 """
 
 import pandas as pd
@@ -17,6 +19,52 @@ import re
 import argparse
 from pathlib import Path
 from collections import defaultdict
+
+
+def get_times(start_times, dur, sms, threshold):
+    """
+    Calculate SM utilization over time using event-driven approach.
+    Exact implementation from process_nsys.py for consistency.
+    
+    Args:
+        start_times: kernel start times (in seconds)
+        dur: kernel durations (in nanoseconds)
+        sms: SM count needed for each kernel
+        threshold: maximum number of SMs (max_sms)
+    
+    Returns:
+        (new_times, new_sm): arrays of time points and SM usage
+    """
+    new_times = []
+    new_sm = []
+    times_sm_all = []
+    
+    sz = len(start_times)
+    
+    # Build events: at each kernel start/end, adjust total SM count
+    for i in range(sz):
+        sti = start_times[i]
+        di = dur[i] * 1e-9  # Convert nanoseconds to seconds
+        smi = sms[i]
+        times_sm_all.append([sti, smi])
+        times_sm_all.append([sti + di, -smi])
+    
+    # Sort events by time
+    times_sm_all = sorted(times_sm_all)
+    
+    # Calculate cumulative SM usage at each time point
+    cur = 0
+    for x in times_sm_all:
+        cur += x[1]
+        new_times.append(x[0])
+        new_sm.append(cur)
+    
+    # Apply threshold (cap at max_sms)
+    total = len(new_sm)
+    for i in range(total):
+        new_sm[i] = min(new_sm[i], threshold)
+    
+    return new_times, new_sm
 
 
 def extract_gemm_params(filename):
@@ -30,9 +78,9 @@ def extract_gemm_params(filename):
     return None, None, None
 
 
-def extract_metrics(csv_path):
+def extract_metrics_ncu(csv_path):
     """
-    Extract GPU performance metrics from NCU profiling CSV.
+    Extract GPU performance metrics from NCU profiling CSV (excluding Avg SMs busy).
     Returns: dictionary with performance metrics
     """
     metrics = {}
@@ -42,15 +90,6 @@ def extract_metrics(csv_path):
         
         if len(df) == 0:
             return None
-        
-        # SM Utilization - percentage of time SMs are actively issuing instructions
-        # This metric directly measures SM busy time as a percentage
-        if 'sm__issue_active.avg.pct_of_peak_sustained_elapsed' in df.columns:
-            val = pd.to_numeric(df['sm__issue_active.avg.pct_of_peak_sustained_elapsed'].iloc[0], 
-                              errors='coerce')
-            if not pd.isna(val):
-                val_float = min(float(val), 100)
-                metrics['Avg SMs busy (%)'] = round(val_float, 1)
         
         # Compute Throughput - SM throughput percentage (Nsight Compute official metric)
         if 'sm__throughput.avg.pct_of_peak_sustained_elapsed' in df.columns:
@@ -80,22 +119,99 @@ def extract_metrics(csv_path):
         return None
 
 
-def process_profile_directory(profile_dir):
+def extract_metrics_nsys(csv_path, max_sms=80):
     """
-    Process all CSV files in the profile directory.
-    Returns: list of dictionaries with results
+    Extract Avg SMs busy (%) from NSys CUDA GPU trace CSV.
+    Uses the exact same method as process_nsys.py for consistency.
+    
+    Args:
+        csv_path: Path to NSys cuda_gpu_trace CSV file
+        max_sms: Maximum number of SMs on GPU (default 80 for common GPUs)
+    
+    Returns:
+        Dictionary with 'Avg SMs busy (%)' or None
+    """
+    try:
+        df = pd.read_csv(csv_path)
+        
+        if len(df) == 0:
+            return None
+        
+        # Extract required columns from cuda_gpu_trace format
+        # Format: Start (ns),Duration (ns),GrdX,GrdY,GrdZ,BlkX,BlkY,BlkZ,Name
+        required_cols = ['Start (ns)', 'Duration (ns)', 'GrdX', 'GrdY', 'GrdZ']
+        if not all(col in df.columns for col in required_cols):
+            return None
+        
+        # Convert to numeric (matching process_nsys.py)
+        start_time_all = pd.to_numeric(df['Start (ns)'], errors='coerce') * 1e-9  # Convert ns to seconds
+        dur_all = pd.to_numeric(df['Duration (ns)'], errors='coerce')
+        grdx = pd.to_numeric(df['GrdX'], errors='coerce')
+        grdy = pd.to_numeric(df['GrdY'], errors='coerce')
+        grdz = pd.to_numeric(df['GrdZ'], errors='coerce')
+        
+        # Calculate SM needed as number of blocks (Grid dimensions)
+        # This is equivalent to SM count that could be needed
+        sms_needed_all = grdx * grdy * grdz
+        
+        # Filter out invalid rows (NaN values or memory operations)
+        valid_mask = ~(start_time_all.isna() | dur_all.isna() | sms_needed_all.isna())
+        
+        start_times = start_time_all[valid_mask].values.astype(float)
+        dur = dur_all[valid_mask].values
+        sms_needed = sms_needed_all[valid_mask].values
+        
+        if len(start_times) == 0:
+            return None
+        
+        # Use event-driven approach (same as process_nsys.py)
+        times, sm_used = get_times(start_times, dur, sms_needed, max_sms)
+        
+        if len(times) < 2:
+            return None
+        
+        # Calculate weighted average SM utilization (same as process_nsys.py)
+        all_time_weight = 0
+        current_weight = 0
+        for i in range(len(times) - 1):
+            current_weight += sm_used[i] * (times[i + 1] - times[i])
+            all_time_weight += max_sms * (times[i + 1] - times[i])
+        
+        if all_time_weight > 0:
+            avg_sm_busy = (current_weight * 100) / all_time_weight
+        else:
+            avg_sm_busy = 0
+        
+        avg_sm_busy = min(float(avg_sm_busy), 100)
+        
+        return {'Avg SMs busy (%)': round(avg_sm_busy, 1)}
+        
+    except Exception as e:
+        print(f"Error processing NSys {csv_path}: {e}", file=sys.stderr)
+        return None
+
+
+def process_profile_directory(ncu_dir, nsys_dir):
+    """
+    Process all CSV files from both NCU and NSys directories.
+    Returns: list of dictionaries with combined results
     """
     results = []
-    profile_path = Path(profile_dir)
+    ncu_path = Path(ncu_dir)
+    nsys_path = Path(nsys_dir)
     
-    if not profile_path.exists():
-        print(f"Error: Directory not found: {profile_dir}", file=sys.stderr)
+    if not ncu_path.exists():
+        print(f"Error: NCU Directory not found: {ncu_dir}", file=sys.stderr)
         return None
     
-    csv_files = sorted(profile_path.glob('gemm_*.csv'))
+    if not nsys_path.exists():
+        print(f"Error: NSys Directory not found: {nsys_dir}", file=sys.stderr)
+        return None
+    
+    csv_files = sorted(ncu_path.glob('gemm_*.csv'))
     
     if not csv_files:
-        print(f"Error: No CSV files found in {profile_dir}", file=sys.stderr)
+        print(f"Error: No CSV files found in {ncu_dir}", file=sys.stderr)
         return None
     
     print(f"📊 Processing {len(csv_files)} profiling files...")
@@ -109,9 +225,21 @@ def process_profile_directory(profile_dir):
             print(f"⚠ Skipping {filename}: Could not parse GEMM parameters")
             continue
         
-        metrics = extract_metrics(str(csv_file))
-        if not metrics:
-            print(f"✗ {filename}: Failed to extract metrics")
+        # Get metrics from NCU
+        metrics_ncu = extract_metrics_ncu(str(csv_file))
+        if not metrics_ncu:
+            print(f"✗ {filename}: Failed to extract NCU metrics")
+            continue
+        
+        # Get metrics from NSys
+        nsys_file = nsys_path / filename
+        if not nsys_file.exists():
+            print(f"⚠ {filename}: No matching NSys file found, skipping")
+            continue
+        
+        metrics_nsys = extract_metrics_nsys(str(nsys_file))
+        if not metrics_nsys:
+            print(f"⚠ {filename}: Failed to extract NSys metrics")
             continue
         
         result = {
@@ -123,7 +251,8 @@ def process_profile_directory(profile_dir):
             'Batch size': 1,
             'FLOPs (GFLOPs)': round(2 * n * k * m / 1e9, 2),  # Calculate theoretical FLOPs
         }
-        result.update(metrics)
+        result.update(metrics_nsys)  # NSys: Avg SMs busy (%)
+        result.update(metrics_ncu)   # NCU: other metrics
         results.append(result)
         
         print(f"✓ n={n:>4}, k={k:>5}, m={m:>4} → Metrics extracted")
@@ -179,9 +308,12 @@ def save_outputs(df, output_csv):
             f.write("| " + " | ".join(str(v) for v in row.values) + " |\n")
         f.write("\n## Legend\n\n")
         f.write("- **N, K, M**: GEMM matrix dimensions (A: N×K, B: K×M, C: N×M)\n")
-        f.write("- **Avg SMs busy (%)**: Streaming Multiprocessor utilization (% of time SMs are issuing instructions)\n")
-        f.write("- **Compute Throughput(%)**: SM throughput utilization (Nsight Compute: sm_throughput)\n")
-        f.write("- **Memory Bandwidth(%)**: GPU compute memory throughput utilization (Nsight Compute: gpu_compute_memory_throughput)\n")
+        f.write("- **Avg SMs busy (%)**: Streaming Multiprocessor utilization from NSys (event-driven weighted average using kernel start/end times and grid dimensions, same method as process_nsys.py)\n")
+        f.write("- **Compute Throughput(%)**: SM throughput utilization from NCU (Nsight Compute: sm_throughput)\n")
+        f.write("- **Memory Bandwidth(%)**: GPU compute memory throughput utilization from NCU (Nsight Compute: gpu_compute_memory_throughput)\n")
+        f.write("\n### Data Sources\n\n")
+        f.write("- **NSys Data**: NVIDIA Nsight Systems cuda_gpu_trace report for kernel execution timing and grid information\n")
+        f.write("- **NCU Data**: NVIDIA Nsight Compute profiling for compute and memory metrics\n")
     
     print(f"✓ Markdown saved to: {md_path}")
     
@@ -190,13 +322,19 @@ def save_outputs(df, output_csv):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Process all NVIDIA NCU profiling CSV files and create benchmark table"
+        description="Process all NVIDIA NCU and NSys profiling CSV files and create benchmark table"
     )
     parser.add_argument(
-        '--input-dir',
+        '--ncu-dir',
         type=str,
         default='profiled_data',
-        help='Directory containing profiling CSV files'
+        help='Directory containing NCU profiling CSV files'
+    )
+    parser.add_argument(
+        '--nsys-dir',
+        type=str,
+        default='profiled_data_nsys',
+        help='Directory containing NSys profiling CSV files'
     )
     parser.add_argument(
         '--output',
@@ -207,8 +345,8 @@ def main():
     
     args = parser.parse_args()
     
-    # Process all profiles
-    results = process_profile_directory(args.input_dir)
+    # Process all profiles from both NCU and NSys
+    results = process_profile_directory(args.ncu_dir, args.nsys_dir)
     
     if not results:
         print("\n❌ No results to process")
